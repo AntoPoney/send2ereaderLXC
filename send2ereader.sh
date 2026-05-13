@@ -73,6 +73,11 @@ fi
 header_info
 
 # -----------------------------------------------------------------------
+# Pre-calculate suggested next CTID (used as default in advanced menu)
+# -----------------------------------------------------------------------
+CTID=$(pvesh get /cluster/nextid)
+
+# -----------------------------------------------------------------------
 # Interactive configuration menu (whiptail)
 # -----------------------------------------------------------------------
 function advanced_settings() {
@@ -92,6 +97,23 @@ function advanced_settings() {
     "1" "Unprivileged (recommended)" \
     "0" "Privileged" \
     --title "Container Type" 3>&1 1>&2 2>&3) || var_unprivileged=1
+
+  # CTID with validation
+  while true; do
+    CTID=$(whiptail --inputbox "Container ID (100–999999999)" 8 58 "$CTID" \
+      --title "Container ID" 3>&1 1>&2 2>&3) || break
+    # Must be a number in valid PVE range
+    if ! [[ "$CTID" =~ ^[0-9]+$ ]] || [[ "$CTID" -lt 100 || "$CTID" -gt 999999999 ]]; then
+      whiptail --msgbox "Invalid ID: must be a number between 100 and 999999999." 8 58 --title "Invalid Input"
+      continue
+    fi
+    # Must not already be in use
+    if pct status "$CTID" &>/dev/null || qm status "$CTID" &>/dev/null; then
+      whiptail --msgbox "Container/VM ID ${CTID} is already in use. Choose another." 8 58 --title "ID In Use"
+      continue
+    fi
+    break
+  done
 }
 
 CHOICE=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
@@ -106,10 +128,6 @@ case "$CHOICE" in
   *) msg_ok "Using default settings" ;;
 esac
 
-# -----------------------------------------------------------------------
-# Determine next available CTID and storage
-# -----------------------------------------------------------------------
-CTID=$(pvesh get /cluster/nextid)
 msg_ok "Container ID: ${BL}${CTID}${CL}"
 
 # Pick first available local storage
@@ -173,7 +191,9 @@ sleep 5
 msg_ok "Container started"
 
 # -----------------------------------------------------------------------
-# Inject install.func as FUNCTIONS_FILE_PATH, then run install script
+# Download install.func and install script ON THE HOST (curl is available
+# here), then push the script into the container and execute it.
+# This avoids the "curl: command not found" error in a fresh Debian CT.
 # -----------------------------------------------------------------------
 msg_info "Downloading community-scripts install functions..."
 FUNCTIONS_FILE_PATH=$(curl -fsSL "$FUNCTIONS_URL")
@@ -183,14 +203,35 @@ if [[ -z "$FUNCTIONS_FILE_PATH" || ${#FUNCTIONS_FILE_PATH} -lt 100 ]]; then
 fi
 msg_ok "Downloaded install functions"
 
-msg_info "Running ${APP} install script inside container..."
-lxc-attach -n "$CTID" -- bash -c \
-  "APP='${APP}' FUNCTIONS_FILE_PATH=$(printf '%q' "$FUNCTIONS_FILE_PATH") bash <(curl -fsSL '${INSTALL_SCRIPT_URL}')"
-
-if [[ $? -ne 0 ]]; then
-  msg_error "Install script failed. Check container ${CTID} logs."
+msg_info "Downloading ${APP} install script..."
+INSTALL_SCRIPT_TMP=$(mktemp /tmp/send2ereader-install-XXXXXX.sh)
+curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT_TMP"
+if [[ ! -s "$INSTALL_SCRIPT_TMP" ]]; then
+  msg_error "Failed to download install script from: $INSTALL_SCRIPT_URL"
+  rm -f "$INSTALL_SCRIPT_TMP"
   exit 1
 fi
+msg_ok "Downloaded install script"
+
+msg_info "Pushing install script into container..."
+pct push "$CTID" "$INSTALL_SCRIPT_TMP" /root/send2ereader-install.sh
+rm -f "$INSTALL_SCRIPT_TMP"
+pct exec "$CTID" -- chmod +x /root/send2ereader-install.sh
+msg_ok "Pushed install script"
+
+msg_info "Running ${APP} install script inside container..."
+pct exec "$CTID" -- bash -c \
+  "export APP='${APP}'; export FUNCTIONS_FILE_PATH=$(printf '%q' "$FUNCTIONS_FILE_PATH"); bash /root/send2ereader-install.sh"
+INSTALL_EXIT=$?
+
+# Cleanup the install script from inside the container
+pct exec "$CTID" -- rm -f /root/send2ereader-install.sh &>/dev/null || true
+
+if [[ $INSTALL_EXIT -ne 0 ]]; then
+  msg_error "Install script failed (exit code: ${INSTALL_EXIT}). Check container ${CTID} logs."
+  exit 1
+fi
+msg_ok "Install script completed"
 
 # -----------------------------------------------------------------------
 # Get container IP and display summary
