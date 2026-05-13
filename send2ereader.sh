@@ -1,67 +1,206 @@
 #!/usr/bin/env bash
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 # Copyright (c) 2021-2026 community-scripts
 # Author: antony.ramon
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://github.com/daniel-j/send2ereader
 
+# -----------------------------------------------------------------------
+# Self-contained LXC creator for Send2eReader
+# Inspired by https://github.com/community-scripts/ProxmoxVE
+# Run this script on your Proxmox VE host.
+# -----------------------------------------------------------------------
+
 APP="Send2eReader"
-var_tags="${var_tags:-ebook}"
-var_cpu="${var_cpu:-1}"
-var_ram="${var_ram:-512}"
-var_disk="${var_disk:-4}"
-var_os="${var_os:-debian}"
-var_version="${var_version:-12}"
-var_unprivileged="${var_unprivileged:-1}"
+NSAPP="send2ereader"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/AntoPoney/send2ereaderLXC/refs/heads/main/send2ereader-install.sh"
+FUNCTIONS_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/install.func"
 
-header_info "$APP"
-variables
-color
-catch_errors
+# --- Default container settings (user can override via menu) ---
+var_os="debian"
+var_version="12"
+var_cpu="1"
+var_ram="512"
+var_disk="4"
+var_unprivileged="1"
+var_hostname="${NSAPP}"
+var_tags="ebook"
 
-function update_script() {
-  header_info
-  check_container_storage
-  check_container_resources
+# -----------------------------------------------------------------------
+# Color helpers
+# -----------------------------------------------------------------------
+YW=$(echo "\033[33m")
+BL=$(echo "\033[36m")
+RD=$(echo "\033[01;31m")
+GN=$(echo "\033[1;92m")
+CL=$(echo "\033[m")
+CM="${GN}✓${CL}"
+CROSS="${RD}✗${CL}"
+INFO="[i]"
+TAB="  "
 
-  if [[ ! -d /opt/send2ereader ]]; then
-    msg_error "No ${APP} Installation Found!"
-    exit
-  fi
+msg_info()  { echo -e "${TAB}${YW}[...] $1${CL}"; }
+msg_ok()    { echo -e "${TAB}${CM} ${GN}$1${CL}"; }
+msg_error() { echo -e "${TAB}${CROSS} ${RD}$1${CL}"; }
 
-  msg_info "Stopping Service"
-  systemctl stop send2ereader
-  msg_ok "Stopped Service"
+header_info() {
+  clear
+  cat <<"EOF"
+   _____                 _  ____      ____                _
+  / ____|               | ||___ \    |  _ \              | |
+ | (___   ___ _ __   __| |  __) |___| |_) | ___  __ _  _| | ___ _ __
+  \___ \ / _ \ '_ \ / _` | |__ < __|  _ < / _ \/ _` |/ _` |/ _ \ '__|
+  ____) |  __/ | | | (_| | ___) \__ \ |_) |  __/ (_| | (_| |  __/ |
+ |_____/ \___|_| |_|\__,_||____/|___/____/ \___|\__,_|\__,_|\___|_|
 
-  msg_info "Backing up application"
-  cd ~
-  mkdir -p send2ereader-backup
-  cp /opt/send2ereader/package.json send2ereader-backup/
-  msg_ok "Backed up application"
-
-  msg_info "Updating ${APP}"
-  cd /opt/send2ereader
-  $STD git pull
-  $STD npm install --omit=dev
-  msg_ok "Updated ${APP}"
-
-  msg_info "Starting Service"
-  systemctl start send2ereader
-  msg_ok "Started Service"
-
-  msg_info "Cleaning up"
-  rm -rf ~/send2ereader-backup
-  msg_ok "Cleaned up"
-
-  msg_ok "Updated successfully!"
-  exit
+EOF
+  echo -e "${BL}  Community-style LXC Script${CL} — ${GN}${APP}${CL}"
+  echo
 }
 
-start
-build_container
-description
+# -----------------------------------------------------------------------
+# Pre-flight checks
+# -----------------------------------------------------------------------
+if ! command -v pveversion &>/dev/null; then
+  msg_error "This script must be run on a Proxmox VE host."
+  exit 1
+fi
 
-msg_ok "Completed successfully!\n"
-echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW} Access it using the following URL:${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:3001${CL}"
+if [[ "$(id -u)" -ne 0 ]]; then
+  msg_error "This script must be run as root."
+  exit 1
+fi
+
+header_info
+
+# -----------------------------------------------------------------------
+# Interactive configuration menu (whiptail)
+# -----------------------------------------------------------------------
+function advanced_settings() {
+  var_cpu=$(whiptail --inputbox "Number of CPU cores" 8 58 "$var_cpu" \
+    --title "CPU Cores" 3>&1 1>&2 2>&3) || var_cpu=1
+
+  var_ram=$(whiptail --inputbox "Amount of RAM (MB)" 8 58 "$var_ram" \
+    --title "RAM (MB)" 3>&1 1>&2 2>&3) || var_ram=512
+
+  var_disk=$(whiptail --inputbox "Disk size (GB)" 8 58 "$var_disk" \
+    --title "Disk Size (GB)" 3>&1 1>&2 2>&3) || var_disk=4
+
+  var_hostname=$(whiptail --inputbox "Container hostname" 8 58 "$var_hostname" \
+    --title "Hostname" 3>&1 1>&2 2>&3) || var_hostname=$NSAPP
+
+  var_unprivileged=$(whiptail --menu "Container type" 10 58 2 \
+    "1" "Unprivileged (recommended)" \
+    "0" "Privileged" \
+    --title "Container Type" 3>&1 1>&2 2>&3) || var_unprivileged=1
+}
+
+CHOICE=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
+  --title "${APP} LXC Setup" \
+  --menu "Choose installation type:" 12 58 2 \
+  "1" "Default settings (recommended)" \
+  "2" "Advanced settings" \
+  3>&1 1>&2 2>&3)
+
+case "$CHOICE" in
+  2) advanced_settings ;;
+  *) msg_ok "Using default settings" ;;
+esac
+
+# -----------------------------------------------------------------------
+# Determine next available CTID and storage
+# -----------------------------------------------------------------------
+CTID=$(pvesh get /cluster/nextid)
+msg_ok "Container ID: ${BL}${CTID}${CL}"
+
+# Pick first available local storage
+STORAGE=$(pvesm status -content rootdir | awk 'NR>1 {print $1; exit}')
+if [[ -z "$STORAGE" ]]; then
+  msg_error "No suitable storage found. Please configure a storage with 'rootdir' content type."
+  exit 1
+fi
+msg_ok "Storage: ${BL}${STORAGE}${CL}"
+
+# -----------------------------------------------------------------------
+# Download template
+# -----------------------------------------------------------------------
+TEMPLATE_STORAGE=$(pvesm status -content vztmpl | awk 'NR>1 {print $1; exit}')
+if [[ -z "$TEMPLATE_STORAGE" ]]; then
+  TEMPLATE_STORAGE="local"
+fi
+
+TEMPLATE="debian-${var_version}-standard_${var_version}.*_amd64.tar.zst"
+TEMPLATE_FILE=$(pvesm list "$TEMPLATE_STORAGE" --content vztmpl 2>/dev/null | grep -o "debian-${var_version}-standard[^ ]*" | head -1)
+
+if [[ -z "$TEMPLATE_FILE" ]]; then
+  msg_info "Downloading Debian ${var_version} template..."
+  pveam update &>/dev/null
+  TEMPLATE_DL=$(pveam available --section system | grep "debian-${var_version}-standard" | sort -V | tail -1 | awk '{print $2}')
+  if [[ -z "$TEMPLATE_DL" ]]; then
+    msg_error "Could not find Debian ${var_version} template."
+    exit 1
+  fi
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_DL" &>/dev/null
+  TEMPLATE_FILE=$(pvesm list "$TEMPLATE_STORAGE" --content vztmpl 2>/dev/null | grep -o "debian-${var_version}-standard[^ ]*" | head -1)
+  msg_ok "Downloaded template: ${BL}${TEMPLATE_FILE}${CL}"
+else
+  msg_ok "Template already available: ${BL}${TEMPLATE_FILE}${CL}"
+fi
+
+# -----------------------------------------------------------------------
+# Create the LXC container
+# -----------------------------------------------------------------------
+msg_info "Creating LXC container ${CTID}..."
+pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_FILE}" \
+  --hostname "$var_hostname" \
+  --cores "$var_cpu" \
+  --memory "$var_ram" \
+  --rootfs "${STORAGE}:${var_disk}" \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+  --onboot 1 \
+  --ostype "${var_os}" \
+  --tags "$var_tags" \
+  --unprivileged "$var_unprivileged" \
+  --features nesting=1 \
+  &>/dev/null
+msg_ok "Created LXC container ${CTID}"
+
+# -----------------------------------------------------------------------
+# Start container
+# -----------------------------------------------------------------------
+msg_info "Starting container..."
+pct start "$CTID"
+sleep 5
+msg_ok "Container started"
+
+# -----------------------------------------------------------------------
+# Inject install.func as FUNCTIONS_FILE_PATH, then run install script
+# -----------------------------------------------------------------------
+msg_info "Downloading community-scripts install functions..."
+FUNCTIONS_FILE_PATH=$(curl -fsSL "$FUNCTIONS_URL")
+if [[ -z "$FUNCTIONS_FILE_PATH" || ${#FUNCTIONS_FILE_PATH} -lt 100 ]]; then
+  msg_error "Failed to download install functions from: $FUNCTIONS_URL"
+  exit 1
+fi
+msg_ok "Downloaded install functions"
+
+msg_info "Running ${APP} install script inside container..."
+lxc-attach -n "$CTID" -- bash -c \
+  "APP='${APP}' FUNCTIONS_FILE_PATH=$(printf '%q' "$FUNCTIONS_FILE_PATH") bash <(curl -fsSL '${INSTALL_SCRIPT_URL}')"
+
+if [[ $? -ne 0 ]]; then
+  msg_error "Install script failed. Check container ${CTID} logs."
+  exit 1
+fi
+
+# -----------------------------------------------------------------------
+# Get container IP and display summary
+# -----------------------------------------------------------------------
+IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+IP="${IP:-<container-ip>}"
+
+echo
+msg_ok "Completed successfully!"
+echo -e "${TAB}${GN}${APP} setup has been successfully initialized!${CL}"
+echo -e "${TAB}${INFO}${YW} Access it using the following URL:${CL}"
+echo -e "${TAB}  ${BL}http://${IP}:3001${CL}"
+echo
