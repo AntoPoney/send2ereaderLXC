@@ -42,11 +42,13 @@ $STD apt-get update
 $STD apt-get install -y libc6:i386 zlib1g:i386
 wget -q "https://github.com/zzet/fp-docker/raw/f2b41fb0af6bb903afd0e429d5487acc62cb9df8/kindlegen_linux_2.6_i386_v2_9.tar.gz" -O /tmp/kindlegen.tar.gz
 mkdir -p /tmp/kindlegen
-tar xzf /tmp/kindlegen.tar.gz -C /tmp/kindlegen
+# Add --no-same-owner to prevent UID mapping errors in unprivileged LXCs
+tar xzf /tmp/kindlegen.tar.gz -C /tmp/kindlegen --no-same-owner
 cp /tmp/kindlegen/kindlegen /usr/local/bin/kindlegen
 chmod +x /usr/local/bin/kindlegen
 rm -rf /tmp/kindlegen /tmp/kindlegen.tar.gz
 msg_ok "Installed KindleGen"
+
 
 msg_info "Installing pdfCropMargins"
 export PIPX_HOME="/opt/pipx"
