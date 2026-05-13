@@ -5,6 +5,9 @@
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://github.com/daniel-j/send2ereader
 
+# APP is passed in as an env var by the CT script; define fallback just in case
+APP="${APP:-Send2eReader}"
+
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 color
 verb_ip6
